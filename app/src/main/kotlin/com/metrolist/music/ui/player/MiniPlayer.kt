@@ -47,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableLongState
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -93,6 +94,7 @@ import com.metrolist.music.constants.ThumbnailCornerRadius
 import com.metrolist.music.constants.UseNewMiniPlayerDesignKey
 import com.metrolist.music.db.entities.ArtistEntity
 import com.metrolist.music.listentogether.ListenTogetherManager
+import com.metrolist.music.connect.resolveDisplayTrack
 import com.metrolist.music.models.MediaMetadata
 import com.metrolist.music.playback.CastConnectionHandler
 import com.metrolist.music.playback.PlayerConnection
@@ -116,8 +118,10 @@ import coil3.request.ImageRequest
 import coil3.request.allowHardware
 import coil3.toBitmap
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.withContext
 import com.metrolist.music.ui.theme.PlayerColorExtractor
+import com.metrolist.music.ui.component.ConnectDevicePicker
 import com.metrolist.music.ui.component.LocalMenuState
 import com.metrolist.music.ui.menu.AddToPlaylistDialog
 
@@ -174,6 +178,7 @@ private fun NewMiniPlayer(
 ) {
     val playerConnection = LocalPlayerConnection.current ?: return
     val menuState = LocalMenuState.current
+    var showConnectPicker by remember { mutableStateOf(false) }
 
     // Theme settings - these rarely change
     val miniPlayerBackground by rememberEnumPreference(
@@ -205,6 +210,43 @@ private fun NewMiniPlayer(
             }
         }
     val isCasting by castHandler?.isCasting?.collectAsState() ?: remember { mutableStateOf(false) }
+
+    val connectManager = remember(playerConnection) {
+        try {
+            playerConnection.service.connectManager
+        } catch (_: Exception) {
+            null
+        }
+    }
+    val isConnectControlling by connectManager?.isControlling?.collectAsState()
+        ?: remember { mutableStateOf(false) }
+    val remotePlaybackState by connectManager?.remotePlaybackState?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val connectedDeviceName by connectManager?.connectedDeviceName?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val hasConnectDevices by connectManager?.discoveredDevices?.collectAsState()
+        ?.let { remember { derivedStateOf { it.value.isNotEmpty() } } }
+        ?: remember { mutableStateOf(false) }
+
+    val displayedMediaMetadata =
+        if (isConnectControlling) {
+            remotePlaybackState.resolveDisplayTrack()?.toConnectDisplayMediaMetadata()
+                ?: connectPlaceholderMediaMetadata(connectedDeviceName)
+        } else {
+            mediaMetadata
+        }
+    val database = LocalDatabase.current
+    val displayedSong by remember(displayedMediaMetadata?.id) {
+        displayedMediaMetadata?.id?.let { database.song(it) } ?: flowOf(null)
+    }.collectAsState(initial = null)
+    val effectiveDisplayedMediaMetadata =
+        remember(displayedMediaMetadata, displayedSong, isConnectControlling) {
+            if (isConnectControlling) {
+                displayedMediaMetadata?.withSongFallback(displayedSong)
+            } else {
+                displayedMediaMetadata
+            }
+        }
 
     // Swipe settings
     val swipeSensitivity by rememberPreference(SwipeSensitivityKey, 0.73f)
@@ -241,10 +283,10 @@ private fun NewMiniPlayer(
             (600 / (1f + kotlin.math.exp(-(-11.44748 * swipeSensitivity + 9.04945)))).roundToInt()
         }
 
-    LaunchedEffect(mediaMetadata?.id, miniPlayerBackground) {
+    LaunchedEffect(effectiveDisplayedMediaMetadata?.id, miniPlayerBackground) {
         gradientColors = emptyList()
         if (miniPlayerBackground == MiniPlayerBackgroundStyle.GRADIENT) {
-            val url = mediaMetadata?.thumbnailUrl
+            val url = effectiveDisplayedMediaMetadata?.thumbnailUrl
             if (url != null) {
                 withContext(Dispatchers.IO) {
                     val request = ImageRequest.Builder(context)
@@ -351,9 +393,9 @@ private fun NewMiniPlayer(
 
                                     if (shouldChangeSong) {
                                         if (currentOffset > 0 && canSkipPrevious) {
-                                            playerConnection.player.seekToPreviousMediaItem()
+                                            playerConnection.seekToPrevious()
                                         } else if (currentOffset <= 0 && canSkipNext) {
-                                            playerConnection.player.seekToNext()
+                                            playerConnection.seekToNext()
                                         }
                                     }
                                     coroutineScope.launch {
@@ -380,7 +422,7 @@ private fun NewMiniPlayer(
             when (miniPlayerBackground) {
                 MiniPlayerBackgroundStyle.BLUR -> {
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                        mediaMetadata?.thumbnailUrl?.let { url ->
+                        effectiveDisplayedMediaMetadata?.thumbnailUrl?.let { url ->
                             AsyncImage(
                                 model = url,
                                 contentDescription = null,
@@ -425,7 +467,9 @@ private fun NewMiniPlayer(
                     isCasting = isCasting,
                     castHandler = castHandler,
                     playerConnection = playerConnection,
-                    mediaMetadata = mediaMetadata,
+                    mediaMetadata = effectiveDisplayedMediaMetadata,
+                    isConnectControlling = isConnectControlling,
+                    isConnectPlaying = remotePlaybackState?.isPlaying ?: false,
                     primaryColor = primaryColor,
                     outlineColor = outlineColor,
                     listenTogetherManager = listenTogetherManager,
@@ -435,7 +479,7 @@ private fun NewMiniPlayer(
 
                 // Song info - isolated composable
                 NewMiniPlayerSongInfo(
-                    mediaMetadata = mediaMetadata,
+                    mediaMetadata = effectiveDisplayedMediaMetadata,
                     onSurfaceColor = onSurfaceColor,
                     errorColor = errorColor,
                     modifier = Modifier.weight(1f),
@@ -454,11 +498,24 @@ private fun NewMiniPlayer(
                     Spacer(modifier = Modifier.width(12.dp))
                 }
 
+                // Metrolist Connect indicator
+                if (isConnectControlling || hasConnectDevices) {
+                    Icon(
+                        painter = painterResource(R.drawable.devices),
+                        contentDescription = stringResource(R.string.metrolist_connect_device_picker_title),
+                        tint = if (isConnectControlling) primaryColor else onSurfaceColor.copy(alpha = 0.5f),
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clickable { showConnectPicker = true },
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                }
+
 // Subscribe button - isolated composable
-                mediaMetadata?.artists?.firstOrNull()?.id?.let { artistId ->
+                effectiveDisplayedMediaMetadata?.artists?.firstOrNull()?.id?.let { artistId ->
                     SubscribeButton(
                         artistId = artistId,
-                        metadata = mediaMetadata!!,
+                        metadata = effectiveDisplayedMediaMetadata,
                         primaryColor = primaryColor,
                         outlineColor = outlineColor,
                         onSurfaceColor = onSurfaceColor,
@@ -468,7 +525,7 @@ private fun NewMiniPlayer(
                 Spacer(modifier = Modifier.width(8.dp))
 
 // Add to playlist button - isolated composable
-                mediaMetadata?.let { metadata ->
+                effectiveDisplayedMediaMetadata?.let { metadata ->
                     AddToPlaylistButton(
                         onClick = {
                             menuState.show {
@@ -487,7 +544,7 @@ private fun NewMiniPlayer(
                 Spacer(modifier = Modifier.width(8.dp))
 
 // Favorite button - isolated composable
-                mediaMetadata?.let { FavoriteButton(
+                effectiveDisplayedMediaMetadata?.let { FavoriteButton(
                     songId = it.id,
                     errorColor = errorColor,
                     outlineColor = outlineColor,
@@ -495,6 +552,19 @@ private fun NewMiniPlayer(
                 )
                 }
             }
+        }
+    }
+
+    // Connect device picker bottom sheet
+    if (showConnectPicker) {
+        val connectMgr = remember(playerConnection) {
+            try { playerConnection.service.connectManager } catch (_: Exception) { null }
+        }
+        connectMgr?.let {
+            ConnectDevicePicker(
+                connectManager = it,
+                onDismiss = { showConnectPicker = false },
+            )
         }
     }
 }
@@ -511,13 +581,20 @@ private fun NewMiniPlayerPlayButton(
     castHandler: CastConnectionHandler?,
     playerConnection: PlayerConnection,
     mediaMetadata: MediaMetadata?,
+    isConnectControlling: Boolean,
+    isConnectPlaying: Boolean,
     primaryColor: Color,
     outlineColor: Color,
     listenTogetherManager: ListenTogetherManager?,
 ) {
     val isPlaying by playerConnection.isPlaying.collectAsState()
     val castIsPlaying by castHandler?.castIsPlaying?.collectAsState() ?: remember { mutableStateOf(false) }
-    val effectiveIsPlaying = if (isCasting) castIsPlaying else isPlaying
+    val effectiveIsPlaying = when {
+        isConnectControlling -> isConnectPlaying
+        isCasting -> castIsPlaying
+        else -> isPlaying
+    }
+    val showEnded = playbackState == Player.STATE_ENDED && !isConnectControlling && !isCasting
     val isListenTogetherGuest = listenTogetherManager?.let { it.isInRoom && !it.isHost } ?: false
     val isMuted by playerConnection.isMuted.collectAsState()
 
@@ -574,9 +651,13 @@ private fun NewMiniPlayerPlayButton(
                             playerConnection.toggleMute()
                             return@clickable
                         }
+                        if (isConnectControlling) {
+                            playerConnection.togglePlayPause()
+                            return@clickable
+                        }
                         if (isCasting) {
                             if (castIsPlaying) castHandler?.pause() else castHandler?.play()
-                        } else if (playbackState == Player.STATE_ENDED) {
+                        } else if (showEnded) {
                             playerConnection.player.seekTo(0, 0)
                             playerConnection.player.playWhenReady = true
                         } else {
@@ -599,7 +680,7 @@ private fun NewMiniPlayerPlayButton(
 
             // Overlay for paused state or muted (guest)
             if (isListenTogetherGuest && isMuted ||
-                (!isListenTogetherGuest && (!effectiveIsPlaying || playbackState == Player.STATE_ENDED))
+                (!isListenTogetherGuest && (!effectiveIsPlaying || showEnded))
             ) {
                 Box(
                     modifier =
@@ -612,7 +693,7 @@ private fun NewMiniPlayerPlayButton(
                         painterResource(
                             if (isListenTogetherGuest) {
                                 if (isMuted) R.drawable.volume_off else R.drawable.volume_up
-                            } else if (playbackState == Player.STATE_ENDED) {
+                            } else if (showEnded) {
                                 R.drawable.replay
                             } else {
                                 R.drawable.play
@@ -710,6 +791,39 @@ private fun LegacyMiniPlayer(
         }
     val isCasting by castHandler?.isCasting?.collectAsState() ?: remember { mutableStateOf(false) }
 
+    val connectManager = remember(playerConnection) {
+        try {
+            playerConnection.service.connectManager
+        } catch (_: Exception) {
+            null
+        }
+    }
+    val isConnectControlling by connectManager?.isControlling?.collectAsState()
+        ?: remember { mutableStateOf(false) }
+    val remotePlaybackState by connectManager?.remotePlaybackState?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val connectedDeviceName by connectManager?.connectedDeviceName?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val displayedMediaMetadata =
+        if (isConnectControlling) {
+            remotePlaybackState.resolveDisplayTrack()?.toConnectDisplayMediaMetadata()
+                ?: connectPlaceholderMediaMetadata(connectedDeviceName)
+        } else {
+            mediaMetadata
+        }
+    val database = LocalDatabase.current
+    val displayedSong by remember(displayedMediaMetadata?.id) {
+        displayedMediaMetadata?.id?.let { database.song(it) } ?: flowOf(null)
+    }.collectAsState(initial = null)
+    val effectiveDisplayedMediaMetadata =
+        remember(displayedMediaMetadata, displayedSong, isConnectControlling) {
+            if (isConnectControlling) {
+                displayedMediaMetadata?.withSongFallback(displayedSong)
+            } else {
+                displayedMediaMetadata
+            }
+        }
+
     val swipeSensitivity by rememberPreference(SwipeSensitivityKey, 0.73f)
     val swipeThumbnailPref by rememberPreference(SwipeThumbnailKey, true)
 
@@ -804,9 +918,9 @@ private fun LegacyMiniPlayer(
 
                                     if (shouldChangeSong) {
                                         if (currentOffset > 0 && canSkipPrevious) {
-                                            playerConnection.player.seekToPreviousMediaItem()
+                                            playerConnection.seekToPrevious()
                                         } else if (currentOffset <= 0 && canSkipNext) {
-                                            playerConnection.player.seekToNext()
+                                            playerConnection.seekToNext()
                                         }
                                     }
                                     coroutineScope.launch { offsetXAnimatable.animateTo(0f, animationSpec) }
@@ -841,7 +955,7 @@ private fun LegacyMiniPlayer(
                     .padding(end = 12.dp),
         ) {
             Box(Modifier.weight(1f)) {
-                mediaMetadata?.let {
+                effectiveDisplayedMediaMetadata?.let {
                     LegacyMiniMediaInfo(
                         mediaMetadata = it,
                         pureBlack = pureBlack,
@@ -855,6 +969,8 @@ private fun LegacyMiniPlayer(
                 isCasting = isCasting,
                 castHandler = castHandler,
                 playerConnection = playerConnection,
+                isConnectControlling = isConnectControlling,
+                isConnectPlaying = remotePlaybackState?.isPlaying ?: false,
                 listenTogetherManager = listenTogetherManager,
             )
 
@@ -897,11 +1013,18 @@ private fun LegacyPlayPauseButton(
     isCasting: Boolean,
     castHandler: CastConnectionHandler?,
     playerConnection: PlayerConnection,
+    isConnectControlling: Boolean,
+    isConnectPlaying: Boolean,
     listenTogetherManager: ListenTogetherManager?,
 ) {
     val isPlaying by playerConnection.isPlaying.collectAsState()
     val castIsPlaying by castHandler?.castIsPlaying?.collectAsState() ?: remember { mutableStateOf(false) }
-    val effectiveIsPlaying = if (isCasting) castIsPlaying else isPlaying
+    val effectiveIsPlaying = when {
+        isConnectControlling -> isConnectPlaying
+        isCasting -> castIsPlaying
+        else -> isPlaying
+    }
+    val showEnded = playbackState == Player.STATE_ENDED && !isConnectControlling && !isCasting
     val isListenTogetherGuest = listenTogetherManager?.let { it.isInRoom && !it.isHost } ?: false
     val isMuted by playerConnection.isMuted.collectAsState()
 
@@ -911,9 +1034,13 @@ private fun LegacyPlayPauseButton(
                 playerConnection.toggleMute()
                 return@IconButton
             }
+            if (isConnectControlling) {
+                playerConnection.togglePlayPause()
+                return@IconButton
+            }
             if (isCasting) {
                 if (castIsPlaying) castHandler?.pause() else castHandler?.play()
-            } else if (playbackState == Player.STATE_ENDED) {
+            } else if (showEnded) {
                 playerConnection.player.seekTo(0, 0)
                 playerConnection.player.playWhenReady = true
             } else {
@@ -926,7 +1053,7 @@ private fun LegacyPlayPauseButton(
                 painterResource(
                     when {
                         isListenTogetherGuest -> if (isMuted) R.drawable.volume_off else R.drawable.volume_up
-                        playbackState == Player.STATE_ENDED -> R.drawable.replay
+                        showEnded -> R.drawable.replay
                         effectiveIsPlaying -> R.drawable.pause
                         else -> R.drawable.play
                     },

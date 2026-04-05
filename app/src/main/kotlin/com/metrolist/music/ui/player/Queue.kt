@@ -95,6 +95,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.widget.Toast
 import androidx.datastore.preferences.core.edit
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
@@ -107,11 +108,11 @@ import com.metrolist.music.constants.ListItemHeight
 import com.metrolist.music.constants.PlayerBackgroundStyle
 import com.metrolist.music.constants.QueueEditLockKey
 import com.metrolist.music.constants.UseNewPlayerDesignKey
+import com.metrolist.music.connect.resolveDisplayTrack
 import com.metrolist.music.extensions.metadata
 import com.metrolist.music.extensions.move
 import com.metrolist.music.extensions.toggleRepeatMode
 import com.metrolist.music.listentogether.RoomRole
-import com.metrolist.music.models.MediaMetadata
 import com.metrolist.music.ui.component.ActionPromptDialog
 import com.metrolist.music.ui.component.BottomSheet
 import com.metrolist.music.ui.component.BottomSheetState
@@ -133,13 +134,9 @@ import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import kotlin.math.roundToInt
 import com.metrolist.music.constants.SleepTimerDefaultKey
-import com.metrolist.music.utils.dataStore
-import androidx.datastore.preferences.core.edit
-import android.widget.Toast
 import androidx.compose.runtime.derivedStateOf
 import com.metrolist.music.constants.SleepTimerFadeOutKey
 import com.metrolist.music.constants.SleepTimerStopAfterCurrentSongKey
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.material3.Button
 
 
@@ -180,11 +177,6 @@ fun Queue(
     val currentWindowIndex by playerConnection.currentWindowIndex.collectAsState()
     val mediaMetadata by playerConnection.mediaMetadata.collectAsState()
 
-    val currentFormat by playerConnection.currentFormat.collectAsState(initial = null)
-
-    val selectedSongs = remember { mutableStateListOf<MediaMetadata>() }
-    val selectedItems = remember { mutableStateListOf<Timeline.Window>() }
-
     // Cast state - safely access castConnectionHandler to prevent crashes during service lifecycle changes
     val castHandler =
         remember(playerConnection) {
@@ -196,6 +188,20 @@ fun Queue(
         }
     val isCasting by castHandler?.isCasting?.collectAsState() ?: remember { mutableStateOf(false) }
     val castIsPlaying by castHandler?.castIsPlaying?.collectAsState() ?: remember { mutableStateOf(false) }
+
+    val connectManager = remember(playerConnection) {
+        try {
+            playerConnection.service.connectManager
+        } catch (_: Exception) {
+            null
+        }
+    }
+    val isConnectControlling by connectManager?.isControlling?.collectAsState()
+        ?: remember { mutableStateOf(false) }
+    val remotePlaybackState by connectManager?.remotePlaybackState?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val connectedDeviceName by connectManager?.connectedDeviceName?.collectAsState()
+        ?: remember { mutableStateOf(null) }
 
     var inSelectMode by rememberSaveable { mutableStateOf(false) }
     val selection =
@@ -212,6 +218,12 @@ fun Queue(
     }
     if (inSelectMode) {
         BackHandler(onBack = onExitSelectionMode)
+    }
+
+    LaunchedEffect(isConnectControlling) {
+        if (isConnectControlling) {
+            onExitSelectionMode()
+        }
     }
 
     var locked by rememberPreference(QueueEditLockKey, defaultValue = true)
@@ -334,10 +346,12 @@ fun Queue(
                     PlayerQueueButton(
                         icon = R.drawable.shuffle,
                         onClick = {
-                            playerConnection.player.shuffleModeEnabled = !shuffleModeEnabled
+                            if (!isConnectControlling) {
+                                playerConnection.player.shuffleModeEnabled = !shuffleModeEnabled
+                            }
                         },
                         isActive = shuffleModeEnabled,
-                        enabled = !isListenTogetherGuest,
+                        enabled = !isListenTogetherGuest && !isConnectControlling,
                         shape = middleShape,
                         modifier = Modifier.size(buttonSize),
                         textButtonColor = textButtonColor,
@@ -368,10 +382,12 @@ fun Queue(
                                 else -> R.drawable.repeat
                             },
                         onClick = {
-                            playerConnection.player.toggleRepeatMode()
+                            if (!isConnectControlling) {
+                                playerConnection.player.toggleRepeatMode()
+                            }
                         },
                         isActive = repeatMode != Player.REPEAT_MODE_OFF,
-                        enabled = !isListenTogetherGuest,
+                        enabled = !isListenTogetherGuest && !isConnectControlling,
                         shape = repeatShape,
                         modifier = Modifier.size(buttonSize),
                         textButtonColor = textButtonColor,
@@ -663,6 +679,26 @@ fun Queue(
             remember(queueWindows) {
                 queueWindows.sumOf { it.mediaItem.metadata!!.duration }
             }
+        val remoteQueue = remotePlaybackState?.queue.orEmpty()
+        val remoteCurrentTrackId = remotePlaybackState.resolveDisplayTrack()?.id
+        val remoteCurrentIndex =
+            remember(remoteQueue, remoteCurrentTrackId) {
+                remoteQueue.indexOfFirst { it.id == remoteCurrentTrackId }.takeIf { it >= 0 } ?: 0
+            }
+        val displayQueueTitle =
+            if (isConnectControlling) {
+                connectedDeviceName?.let { stringResource(R.string.metrolist_connect_controlling, it) }
+                    ?: stringResource(R.string.metrolist_connect)
+            } else {
+                queueTitle.orEmpty()
+            }
+        val displayQueueCount = if (isConnectControlling) remoteQueue.size else queueWindows.size
+        val displayQueueLengthMs =
+            if (isConnectControlling) {
+                remoteQueue.sumOf { it.duration.coerceAtLeast(0L) }
+            } else {
+                queueLength * 1000L
+            }
 
         val coroutineScope = rememberCoroutineScope()
 
@@ -738,7 +774,11 @@ fun Queue(
         }
 
         LaunchedEffect(mutableQueueWindows) {
-            if (currentWindowIndex != -1) {
+            if (isConnectControlling) {
+                if (remoteQueue.isNotEmpty()) {
+                    lazyListState.scrollToItem(remoteCurrentIndex)
+                }
+            } else if (currentWindowIndex != -1) {
                 lazyListState.scrollToItem(currentWindowIndex)
             }
         }
@@ -766,263 +806,312 @@ fun Queue(
                         modifier =
                             Modifier
                                 .animateContentSize()
-                                .height(if (inSelectMode) 48.dp else 0.dp),
+                                .height(if (inSelectMode && !isConnectControlling) 48.dp else 0.dp),
                     )
                 }
 
-                itemsIndexed(
-                    items = mutableQueueWindows,
-                    key = { _, item -> item.uid.hashCode() },
-                ) { index, window ->
-                    ReorderableItem(
-                        state = reorderableState,
-                        key = window.uid.hashCode(),
-                    ) {
-                        val currentItem by rememberUpdatedState(window)
-                        val isActive = window.uid == currentPlayingUid
-                        val dismissBoxState =
-                            rememberSwipeToDismissBoxState(
-                                positionalThreshold = { totalDistance -> totalDistance },
-                            )
+                if (isConnectControlling) {
+                    itemsIndexed(
+                        items = remoteQueue,
+                        key = { index, item -> "${item.id}-$index" },
+                    ) { index, remoteTrack ->
+                        val remoteMetadata = remember(remoteTrack) { remoteTrack.toConnectDisplayMediaMetadata() }
+                        val isActive = remoteTrack.id == remoteCurrentTrackId
 
-                        var processedDismiss by remember { mutableStateOf(false) }
-                        val removedSongMsg =
-                            stringResource(R.string.removed_song_from_playlist, currentItem.mediaItem.metadata?.title ?: "")
-                        val undoStr = stringResource(R.string.undo)
-                        LaunchedEffect(dismissBoxState.currentValue) {
-                            val dv = dismissBoxState.currentValue
-                            if (!processedDismiss && !isListenTogetherGuest && (
-                                    dv == SwipeToDismissBoxValue.StartToEnd ||
-                                        dv == SwipeToDismissBoxValue.EndToStart
-                                )
-                            ) {
-                                processedDismiss = true
-                                playerConnection.player.removeMediaItem(currentItem.firstPeriodIndex)
-                                dismissJob?.cancel()
-                                dismissJob =
-                                    coroutineScope.launch {
-                                        val snackbarResult =
-                                            snackbarHostState.showSnackbar(
-                                                message = removedSongMsg,
-                                                actionLabel = undoStr,
-                                                duration = SnackbarDuration.Short,
-                                            )
-                                        if (snackbarResult == SnackbarResult.ActionPerformed) {
-                                            playerConnection.player.addMediaItem(currentItem.mediaItem)
-                                            playerConnection.player.moveMediaItem(
-                                                mutableQueueWindows.size,
-                                                currentItem.firstPeriodIndex,
-                                            )
-                                        }
+                        Row(
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier.animateItem(),
+                        ) {
+                            MediaMetadataListItem(
+                                mediaMetadata = remoteMetadata,
+                                isSelected = false,
+                                isActive = isActive,
+                                isPlaying = (remotePlaybackState?.isPlaying == true) && isActive,
+                                trailingContent = {
+                                    IconButton(
+                                        onClick = {
+                                            bottomSheetPageState.show {
+                                                ShowMediaInfo(remoteTrack.id)
+                                            }
+                                        },
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.info),
+                                            contentDescription = null,
+                                        )
                                     }
-                            }
-                            if (dv == SwipeToDismissBoxValue.Settled) {
-                                processedDismiss = false
-                            }
+                                },
+                                modifier =
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .background(background)
+                                        .combinedClickable(
+                                            onClick = {
+                                                if (!isListenTogetherGuest) {
+                                                    if (index == remoteCurrentIndex) {
+                                                        playerConnection.togglePlayPause()
+                                                    } else {
+                                                        playerConnection.seekToDefaultPosition(index, remoteTrack.id)
+                                                    }
+                                                }
+                                            },
+                                            onLongClick = {},
+                                        ),
+                            )
                         }
+                    }
+                } else {
+                    itemsIndexed(
+                        items = mutableQueueWindows,
+                        key = { _, item -> item.uid.hashCode() },
+                    ) { index, window ->
+                        ReorderableItem(
+                            state = reorderableState,
+                            key = window.uid.hashCode(),
+                        ) {
+                            val currentItem by rememberUpdatedState(window)
+                            val isActive = window.uid == currentPlayingUid
+                            val dismissBoxState =
+                                rememberSwipeToDismissBoxState(
+                                    positionalThreshold = { totalDistance -> totalDistance },
+                                )
 
-                        val onCheckedChange: (Boolean) -> Unit = {
-                            if (it) {
-                                selection.add(window.mediaItem.mediaId)
-                            } else {
-                                selection.remove(window.mediaItem.mediaId)
+                            var processedDismiss by remember { mutableStateOf(false) }
+                            val removedSongMsg =
+                                stringResource(R.string.removed_song_from_playlist, currentItem.mediaItem.metadata?.title ?: "")
+                            val undoStr = stringResource(R.string.undo)
+                            LaunchedEffect(dismissBoxState.currentValue) {
+                                val dv = dismissBoxState.currentValue
+                                if (!processedDismiss && !isListenTogetherGuest && (
+                                        dv == SwipeToDismissBoxValue.StartToEnd ||
+                                            dv == SwipeToDismissBoxValue.EndToStart
+                                    )
+                                ) {
+                                    processedDismiss = true
+                                    playerConnection.player.removeMediaItem(currentItem.firstPeriodIndex)
+                                    dismissJob?.cancel()
+                                    dismissJob =
+                                        coroutineScope.launch {
+                                            val snackbarResult =
+                                                snackbarHostState.showSnackbar(
+                                                    message = removedSongMsg,
+                                                    actionLabel = undoStr,
+                                                    duration = SnackbarDuration.Short,
+                                                )
+                                            if (snackbarResult == SnackbarResult.ActionPerformed) {
+                                                playerConnection.player.addMediaItem(currentItem.mediaItem)
+                                                playerConnection.player.moveMediaItem(
+                                                    mutableQueueWindows.size,
+                                                    currentItem.firstPeriodIndex,
+                                                )
+                                            }
+                                        }
+                                }
+                                if (dv == SwipeToDismissBoxValue.Settled) {
+                                    processedDismiss = false
+                                }
                             }
-                        }
 
-                        val content: @Composable () -> Unit = {
-                            Row(
-                                horizontalArrangement = Arrangement.Center,
-                                modifier = Modifier.animateItem(),
-                            ) {
-                                MediaMetadataListItem(
-                                    mediaMetadata = window.mediaItem.metadata!!,
-                                    isSelected = false,
-                                    isActive = isActive,
-                                    isPlaying = isPlaying && isActive,
-                                    trailingContent = {
-                                        if (inSelectMode) {
-                                            Checkbox(
-                                                checked = window.mediaItem.mediaId in selection,
-                                                onCheckedChange = onCheckedChange,
-                                            )
-                                        } else {
-                                            if (!isListenTogetherGuest) {
-                                                IconButton(
-                                                    onClick = {
-                                                        menuState.show {
-                                                            QueueMenu(
-                                                                mediaMetadata = window.mediaItem.metadata!!,
-                                                                navController = navController,
-                                                                playerBottomSheetState = playerBottomSheetState,
-                                                                onShowDetailsDialog = {
-                                                                    window.mediaItem.mediaId.let {
-                                                                        bottomSheetPageState.show {
-                                                                            ShowMediaInfo(it)
+                            val onCheckedChange: (Boolean) -> Unit = {
+                                if (it) {
+                                    selection.add(window.mediaItem.mediaId)
+                                } else {
+                                    selection.remove(window.mediaItem.mediaId)
+                                }
+                            }
+
+                            val content: @Composable () -> Unit = {
+                                Row(
+                                    horizontalArrangement = Arrangement.Center,
+                                    modifier = Modifier.animateItem(),
+                                ) {
+                                    MediaMetadataListItem(
+                                        mediaMetadata = window.mediaItem.metadata!!,
+                                        isSelected = false,
+                                        isActive = isActive,
+                                        isPlaying = isPlaying && isActive,
+                                        trailingContent = {
+                                            if (inSelectMode) {
+                                                Checkbox(
+                                                    checked = window.mediaItem.mediaId in selection,
+                                                    onCheckedChange = onCheckedChange,
+                                                )
+                                            } else {
+                                                if (!isListenTogetherGuest) {
+                                                    IconButton(
+                                                        onClick = {
+                                                            menuState.show {
+                                                                QueueMenu(
+                                                                    mediaMetadata = window.mediaItem.metadata!!,
+                                                                    navController = navController,
+                                                                    playerBottomSheetState = playerBottomSheetState,
+                                                                    onShowDetailsDialog = {
+                                                                        window.mediaItem.mediaId.let {
+                                                                            bottomSheetPageState.show {
+                                                                                ShowMediaInfo(it)
+                                                                            }
                                                                         }
-                                                                    }
-                                                                },
-                                                                onDismiss = menuState::dismiss,
-                                                            )
-                                                        }
-                                                    },
-                                                ) {
-                                                    Icon(
-                                                        painter = painterResource(R.drawable.more_vert),
-                                                        contentDescription = null,
-                                                    )
+                                                                    },
+                                                                    onDismiss = menuState::dismiss,
+                                                                )
+                                                            }
+                                                        },
+                                                    ) {
+                                                        Icon(
+                                                            painter = painterResource(R.drawable.more_vert),
+                                                            contentDescription = null,
+                                                        )
+                                                    }
+                                                }
+                                                if (!locked && !isListenTogetherGuest) {
+                                                    IconButton(
+                                                        onClick = { },
+                                                        modifier = Modifier.draggableHandle(),
+                                                    ) {
+                                                        Icon(
+                                                            painter = painterResource(R.drawable.drag_handle),
+                                                            contentDescription = null,
+                                                        )
+                                                    }
                                                 }
                                             }
-                                            if (!locked && !isListenTogetherGuest) {
-                                                IconButton(
-                                                    onClick = { },
-                                                    modifier = Modifier.draggableHandle(),
-                                                ) {
-                                                    Icon(
-                                                        painter = painterResource(R.drawable.drag_handle),
-                                                        contentDescription = null,
+                                        },
+                                        modifier =
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .background(background)
+                                                .combinedClickable(
+                                                    onClick = {
+                                                        if (inSelectMode) {
+                                                            onCheckedChange(window.mediaItem.mediaId !in selection)
+                                                        } else if (!isListenTogetherGuest) {
+                                                            if (index == currentWindowIndex) {
+                                                                if (isCasting) {
+                                                                    if (castIsPlaying) {
+                                                                        castHandler?.pause()
+                                                                    } else {
+                                                                        castHandler?.play()
+                                                                    }
+                                                                } else {
+                                                                    playerConnection.togglePlayPause()
+                                                                }
+                                                            } else {
+                                                                if (isCasting) {
+                                                                    val mediaId = window.mediaItem.mediaId
+                                                                    val navigated = castHandler?.navigateToMediaIfInQueue(mediaId) ?: false
+                                                                    if (!navigated) {
+                                                                        playerConnection.seekToDefaultPosition(window.firstPeriodIndex, mediaId)
+                                                                    }
+                                                                } else {
+                                                                    playerConnection.seekToDefaultPosition(window.firstPeriodIndex, window.mediaItem.mediaId)
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    onLongClick = {
+                                                        if (!inSelectMode) {
+                                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                            inSelectMode = true
+                                                            onCheckedChange(true)
+                                                        }
+                                                    },
+                                                ),
+                                    )
+                                }
+                            }
+
+                            if (locked) {
+                                content()
+                            } else {
+                                SwipeToDismissBox(
+                                    state = dismissBoxState,
+                                    backgroundContent = {},
+                                ) {
+                                    content()
+                                }
+                            }
+                        }
+                    }
+
+                    if (automix.isNotEmpty()) {
+                        item(key = "automix_divider") {
+                            HorizontalDivider(
+                                modifier =
+                                    Modifier
+                                        .padding(vertical = 8.dp, horizontal = 4.dp)
+                                        .animateItem(),
+                            )
+
+                            Text(
+                                text = stringResource(R.string.similar_content),
+                                modifier = Modifier.padding(start = 16.dp),
+                            )
+                        }
+
+                        itemsIndexed(
+                            items = automix,
+                            key = { _, it -> it.mediaId },
+                        ) { index, item ->
+                            Row(
+                                horizontalArrangement = Arrangement.Center,
+                            ) {
+                                MediaMetadataListItem(
+                                    mediaMetadata = item.metadata!!,
+                                    trailingContent = {
+                                        if (!isListenTogetherGuest) {
+                                            IconButton(
+                                                onClick = {
+                                                    playerConnection.service.playNextAutomix(
+                                                        item,
+                                                        index,
                                                     )
-                                                }
+                                                },
+                                            ) {
+                                                Icon(
+                                                    painter = painterResource(R.drawable.playlist_play),
+                                                    contentDescription = null,
+                                                )
+                                            }
+                                            IconButton(
+                                                onClick = {
+                                                    playerConnection.service.addToQueueAutomix(
+                                                        item,
+                                                        index,
+                                                    )
+                                                },
+                                            ) {
+                                                Icon(
+                                                    painter = painterResource(R.drawable.queue_music),
+                                                    contentDescription = null,
+                                                )
                                             }
                                         }
                                     },
                                     modifier =
                                         Modifier
                                             .fillMaxWidth()
-                                            .background(background)
                                             .combinedClickable(
-                                                onClick = {
-                                                    if (inSelectMode) {
-                                                        onCheckedChange(window.mediaItem.mediaId !in selection)
-                                                    } else if (!isListenTogetherGuest) {
-                                                        if (index == currentWindowIndex) {
-                                                            if (isCasting) {
-                                                                if (castIsPlaying) {
-                                                                    castHandler?.pause()
-                                                                } else {
-                                                                    castHandler?.play()
-                                                                }
-                                                            } else {
-                                                                playerConnection.togglePlayPause()
-                                                            }
-                                                        } else {
-                                                            if (isCasting) {
-                                                                val mediaId = window.mediaItem.mediaId
-                                                                val navigated = castHandler?.navigateToMediaIfInQueue(mediaId) ?: false
-                                                                if (!navigated) {
-                                                                    playerConnection.player.seekToDefaultPosition(window.firstPeriodIndex)
-                                                                }
-                                                            } else {
-                                                                playerConnection.player.seekToDefaultPosition(
-                                                                    window.firstPeriodIndex,
-                                                                )
-                                                                playerConnection.player.playWhenReady = true
-                                                            }
-                                                        }
-                                                    }
-                                                },
+                                                onClick = {},
                                                 onLongClick = {
-                                                    if (!inSelectMode) {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        inSelectMode = true
-                                                        onCheckedChange(true)
+                                                    menuState.show {
+                                                        QueueMenu(
+                                                            mediaMetadata = item.metadata!!,
+                                                            navController = navController,
+                                                            playerBottomSheetState = playerBottomSheetState,
+                                                            onShowDetailsDialog = {
+                                                                item.mediaId.let {
+                                                                    bottomSheetPageState.show {
+                                                                        ShowMediaInfo(it)
+                                                                    }
+                                                                }
+                                                            },
+                                                            onDismiss = menuState::dismiss,
+                                                        )
                                                     }
                                                 },
-                                            ),
+                                            ).animateItem(),
                                 )
                             }
-                        }
-
-                        if (locked) {
-                            content()
-                        } else {
-                            SwipeToDismissBox(
-                                state = dismissBoxState,
-                                backgroundContent = {},
-                            ) {
-                                content()
-                            }
-                        }
-                    }
-                }
-
-                if (automix.isNotEmpty()) {
-                    item(key = "automix_divider") {
-                        HorizontalDivider(
-                            modifier =
-                                Modifier
-                                    .padding(vertical = 8.dp, horizontal = 4.dp)
-                                    .animateItem(),
-                        )
-
-                        Text(
-                            text = stringResource(R.string.similar_content),
-                            modifier = Modifier.padding(start = 16.dp),
-                        )
-                    }
-
-                    itemsIndexed(
-                        items = automix,
-                        key = { _, it -> it.mediaId },
-                    ) { index, item ->
-                        Row(
-                            horizontalArrangement = Arrangement.Center,
-                        ) {
-                            MediaMetadataListItem(
-                                mediaMetadata = item.metadata!!,
-                                trailingContent = {
-                                    if (!isListenTogetherGuest) {
-                                        IconButton(
-                                            onClick = {
-                                                playerConnection.service.playNextAutomix(
-                                                    item,
-                                                    index,
-                                                )
-                                            },
-                                        ) {
-                                            Icon(
-                                                painter = painterResource(R.drawable.playlist_play),
-                                                contentDescription = null,
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = {
-                                                playerConnection.service.addToQueueAutomix(
-                                                    item,
-                                                    index,
-                                                )
-                                            },
-                                        ) {
-                                            Icon(
-                                                painter = painterResource(R.drawable.queue_music),
-                                                contentDescription = null,
-                                            )
-                                        }
-                                    }
-                                },
-                                modifier =
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .combinedClickable(
-                                            onClick = {},
-                                            onLongClick = {
-                                                menuState.show {
-                                                    QueueMenu(
-                                                        mediaMetadata = item.metadata!!,
-                                                        navController = navController,
-                                                        playerBottomSheetState = playerBottomSheetState,
-                                                        onShowDetailsDialog = {
-                                                            item.mediaId.let {
-                                                                bottomSheetPageState.show {
-                                                                    ShowMediaInfo(it)
-                                                                }
-                                                            }
-                                                        },
-                                                        onDismiss = menuState::dismiss,
-                                                    )
-                                                }
-                                            },
-                                        ).animateItem(),
-                            )
                         }
                     }
                 }
@@ -1058,7 +1147,7 @@ fun Queue(
                         .padding(horizontal = 12.dp),
             ) {
                 Text(
-                    text = queueTitle.orEmpty(),
+                    text = displayQueueTitle,
                     style = MaterialTheme.typography.titleMedium,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -1066,7 +1155,7 @@ fun Queue(
                 )
 
                 AnimatedVisibility(
-                    visible = !inSelectMode,
+                    visible = !inSelectMode && !isConnectControlling,
                     enter = fadeIn() + slideInVertically { it },
                     exit = fadeOut() + slideOutVertically { it },
                 ) {
@@ -1091,21 +1180,21 @@ fun Queue(
                         text =
                             pluralStringResource(
                                 R.plurals.n_song,
-                                queueWindows.size,
-                                queueWindows.size,
+                                displayQueueCount,
+                                displayQueueCount,
                             ),
                         style = MaterialTheme.typography.bodyMedium,
                     )
 
                     Text(
-                        text = makeTimeString(queueLength * 1000L),
+                        text = makeTimeString(displayQueueLengthMs),
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
             }
 
             AnimatedVisibility(
-                visible = inSelectMode,
+                visible = inSelectMode && !isConnectControlling,
                 enter = fadeIn() + expandVertically(),
                 exit = fadeOut() + shrinkVertically(),
             ) {
@@ -1205,22 +1294,24 @@ fun Queue(
                     ).padding(12.dp),
         ) {
             IconButton(
-                enabled = !isListenTogetherGuest,
+                enabled = !isListenTogetherGuest && !isConnectControlling,
                 modifier = Modifier.align(Alignment.CenterStart),
                 onClick = {
-                    coroutineScope
-                        .launch {
-                            lazyListState.animateScrollToItem(
-                                if (playerConnection.player.shuffleModeEnabled) playerConnection.player.currentMediaItemIndex else 0,
-                            )
-                        }.invokeOnCompletion {
-                            playerConnection.player.shuffleModeEnabled =
-                                !playerConnection.player.shuffleModeEnabled
-                        }
+                    if (!isConnectControlling) {
+                        coroutineScope
+                            .launch {
+                                lazyListState.animateScrollToItem(
+                                    if (playerConnection.player.shuffleModeEnabled) playerConnection.player.currentMediaItemIndex else 0,
+                                )
+                            }.invokeOnCompletion {
+                                playerConnection.player.shuffleModeEnabled =
+                                    !playerConnection.player.shuffleModeEnabled
+                            }
+                    }
                 },
             ) {
                 val baseAlpha = if (shuffleModeEnabled) 1f else 0.5f
-                val finalAlpha = if (!isListenTogetherGuest) baseAlpha else 0.3f
+                val finalAlpha = if (!isListenTogetherGuest && !isConnectControlling) baseAlpha else 0.3f
                 Icon(
                     painter = painterResource(R.drawable.shuffle),
                     contentDescription = null,
@@ -1235,12 +1326,16 @@ fun Queue(
             )
 
             IconButton(
-                enabled = !isListenTogetherGuest,
+                enabled = !isListenTogetherGuest && !isConnectControlling,
                 modifier = Modifier.align(Alignment.CenterEnd),
-                onClick = playerConnection.player::toggleRepeatMode,
+                onClick = {
+                    if (!isConnectControlling) {
+                        playerConnection.player.toggleRepeatMode()
+                    }
+                },
             ) {
                 val baseAlpha = if (repeatMode == Player.REPEAT_MODE_OFF) 0.5f else 1f
-                val finalAlpha = if (!isListenTogetherGuest) baseAlpha else 0.3f
+                val finalAlpha = if (!isListenTogetherGuest && !isConnectControlling) baseAlpha else 0.3f
                 Icon(
                     painter =
                         painterResource(

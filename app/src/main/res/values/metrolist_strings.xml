@@ -388,6 +388,30 @@
     <string name="google_cast">Google Cast</string>
     <string name="google_cast_description">Cast audio to Chromecast and other Cast-enabled devices</string>
 
+    <!-- Metrolist Connect -->
+    <string name="metrolist_connect">Metrolist Connect</string>
+    <string name="metrolist_connect_description">Control playback across devices on the same network</string>
+    <string name="metrolist_connect_enabled">Enable Metrolist Connect</string>
+    <string name="metrolist_connect_enabled_desc">Advertise this device and discover others on the local network</string>
+    <string name="metrolist_connect_device_name">Device name</string>
+    <string name="metrolist_connect_device_picker_title">Devices</string>
+    <string name="metrolist_connect_this_device">This device</string>
+    <string name="metrolist_connect_playing_on">Playing on %s</string>
+    <string name="metrolist_connect_controlling">Controlling %s</string>
+    <string name="metrolist_connect_transfer_playback">Transfer playback</string>
+    <string name="metrolist_connect_take_over">Play on this device</string>
+    <string name="metrolist_connect_no_devices">No devices found on this network</string>
+    <string name="metrolist_connect_scanning">Scanning for devices…</string>
+    <string name="metrolist_connect_connecting">Connecting to %s…</string>
+    <string name="metrolist_connect_connected">Connected to %s</string>
+    <string name="metrolist_connect_disconnected">Disconnected</string>
+    <string name="metrolist_connect_auth_failed">Authentication failed — different account</string>
+    <string name="metrolist_connect_requires_login">Sign in to use Metrolist Connect</string>
+    <string name="metrolist_connect_notification_controller">Controlling %s</string>
+    <string name="metrolist_connect_notification_receiver">Being controlled by %s</string>
+    <string name="metrolist_connect_notification_channel_name">Metrolist Connect</string>
+    <string name="metrolist_connect_notification_channel_desc">Notifications for Metrolist Connect remote control</string>
+
     <string name="lyrics_romanize_macedonian">Romanize Macedonian lyrics</string>
     <string name="lyrics_romanize_as_main">Show romanized lyrics as main</string>
 

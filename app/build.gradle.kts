@@ -277,6 +277,11 @@ dependencies {
     implementation(libs.ktor.client.cio)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.json)
+    implementation(libs.ktor.server.cio)
+    implementation(libs.ktor.server.websockets)
+
+    // BouncyCastle for reliable X25519 on all Android versions (some vendors omit JCA X25519)
+    implementation(libs.bouncycastle)
 
     // Protobuf for message serialization (lite version for Android)
     implementation(libs.protobuf.javalite)

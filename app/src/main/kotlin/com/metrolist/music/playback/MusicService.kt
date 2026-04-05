@@ -90,6 +90,7 @@ import com.metrolist.music.constants.AudioQualityKey
 import com.metrolist.music.constants.AutoDownloadOnLikeKey
 import com.metrolist.music.constants.AutoLoadMoreKey
 import com.metrolist.music.constants.AutoSkipNextOnErrorKey
+import com.metrolist.music.connect.ConnectManager
 import com.metrolist.music.constants.CrossfadeDurationKey
 import com.metrolist.music.constants.CrossfadeEnabledKey
 import com.metrolist.music.constants.CrossfadeGaplessKey
@@ -407,6 +408,13 @@ class MusicService :
     var castConnectionHandler: CastConnectionHandler? = null
         private set
 
+    // Metrolist Connect
+    var connectManager: ConnectManager? = null
+        private set
+    private var connectNotificationProvider: ConnectAwareMediaNotificationProvider? = null
+    private var connectSessionPlayer: ConnectAwareSessionPlayer? = null
+    private var connectSessionPlayerBase: Player? = null
+
     private val screenStateReceiver =
         object : BroadcastReceiver() {
             override fun onReceive(
@@ -510,16 +518,18 @@ class MusicService :
             }
         }
 
-        setMediaNotificationProvider(
-            DefaultMediaNotificationProvider(
+        val provider =
+            ConnectAwareMediaNotificationProvider(
+                this,
                 this,
                 { NOTIFICATION_ID },
                 CHANNEL_ID,
                 R.string.music_player,
             ).apply {
                 setSmallIcon(R.drawable.small_icon)
-            },
-        )
+            }
+        connectNotificationProvider = provider
+        setMediaNotificationProvider(provider)
         player = createExoPlayer()
         player.addListener(this@MusicService)
         sleepTimer =
@@ -554,6 +564,7 @@ class MusicService :
                     ),
                 ).setBitmapLoader(CoilBitmapLoader(this, scope))
                 .build()
+            updateSessionPlayerForConnectState()
         player.repeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
 
         // Restore shuffle mode if remember option is enabled
@@ -583,6 +594,9 @@ class MusicService :
 
         // Initialize Google Cast
         initializeCast()
+
+        // Initialize Metrolist Connect
+        initializeConnect()
 
         // Update lyrics provider order preference
         // Collecting this flow activates the internal map that updates lyricsProviders in LyricsHelper
@@ -3239,6 +3253,7 @@ class MusicService :
         }
         audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
         castConnectionHandler?.release()
+        connectManager?.release()
         if (dataStore.get(PersistentQueueKey, true)) {
             saveQueueToDisk()
         }
@@ -3498,6 +3513,93 @@ class MusicService :
         }
     }
 
+    /**
+     * Initialize Metrolist Connect for local network playback control.
+     */
+    private fun initializeConnect() {
+        try {
+            connectManager = ConnectManager(this, dataStore, scope)
+            connectManager?.initialize(this)
+
+            connectManager?.let { manager ->
+                scope.launch {
+                    combine(
+                        manager.isControlling,
+                        manager.isReceiving,
+                        manager.connectedDeviceName,
+                        manager.remotePlaybackState,
+                        manager.connectedControllers,
+                    ) { controlling, receiving, deviceName, remote, controllers ->
+                        NotificationSyncState(
+                            controlling = controlling,
+                            receiving = receiving,
+                            deviceName = deviceName,
+                            trackId = remote?.currentTrack?.id ?: remote?.queue?.firstOrNull()?.id,
+                            trackTitle = remote?.currentTrack?.title ?: remote?.queue?.firstOrNull()?.title,
+                            trackArtist = remote?.currentTrack?.artist ?: remote?.queue?.firstOrNull()?.artist,
+                            isRemotePlaying = remote?.isPlaying,
+                            controllers = controllers.joinToString("|"),
+                        )
+                    }.distinctUntilChanged()
+                        .collect {
+                            updateSessionPlayerForConnectState(forceRefresh = true)
+                            updateNotification()
+                            applyConnectOverrideToForegroundNotification()
+                        }
+                }
+            }
+
+            timber.log.Timber.d("Metrolist Connect initialized")
+        } catch (e: Exception) {
+            timber.log.Timber.e(e, "Failed to initialize Metrolist Connect")
+        }
+    }
+
+    private data class NotificationSyncState(
+        val controlling: Boolean,
+        val receiving: Boolean,
+        val deviceName: String?,
+        val trackId: String?,
+        val trackTitle: String?,
+        val trackArtist: String?,
+        val isRemotePlaying: Boolean?,
+        val controllers: String,
+    )
+
+    private fun applyConnectOverrideToForegroundNotification() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+
+        val provider = connectNotificationProvider ?: return
+        val nm = getSystemService(NotificationManager::class.java) ?: return
+        val active = nm.activeNotifications.firstOrNull { it.id == NOTIFICATION_ID } ?: return
+        val overridden = provider.overrideNotificationContent(active.notification)
+        nm.notify(NOTIFICATION_ID, overridden)
+    }
+
+    private fun updateSessionPlayerForConnectState(forceRefresh: Boolean = false) {
+        val session = mediaSession
+        val manager = connectManager
+        val shouldUseConnectPlayer = manager?.isControlling?.value == true
+
+        val targetPlayer: Player =
+            if (shouldUseConnectPlayer) {
+                val activeManager = manager
+                if (forceRefresh || connectSessionPlayer == null || connectSessionPlayerBase !== player) {
+                    connectSessionPlayer = ConnectAwareSessionPlayer(player, activeManager)
+                    connectSessionPlayerBase = player
+                }
+                connectSessionPlayer!!
+            } else {
+                connectSessionPlayer = null
+                connectSessionPlayerBase = null
+                player
+            }
+
+        if (session.player !== targetPlayer) {
+            session.player = targetPlayer
+        }
+    }
+
     override fun onPositionDiscontinuity(
         oldPosition: Player.PositionInfo,
         newPosition: Player.PositionInfo,
@@ -3624,7 +3726,7 @@ class MusicService :
         sleepTimer.player = player
 
         try {
-            (mediaSession as MediaSession).player = player
+            updateSessionPlayerForConnectState()
         } catch (e: Exception) {
             timber.log.Timber.e(e, "Failed to swap player in MediaSession")
         }

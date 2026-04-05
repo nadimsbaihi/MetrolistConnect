@@ -172,6 +172,10 @@ val ListenTogetherSyncVolumeKey = booleanPreferencesKey("listenTogetherSyncVolum
 val ListenTogetherBlockedUsersKey = stringPreferencesKey("listenTogetherBlockedUsers")
 val ListenTogetherInTopBarKey = booleanPreferencesKey("listenTogetherInTopBar")
 
+// Metrolist Connect
+val MetrolistConnectEnabledKey = booleanPreferencesKey("metrolistConnectEnabled")
+val MetrolistConnectDeviceNameKey = stringPreferencesKey("metrolistConnectDeviceName")
+
 // Session persistence for reconnection
 val ListenTogetherSessionTokenKey = stringPreferencesKey("listenTogetherSessionToken")
 val ListenTogetherRoomCodeKey = stringPreferencesKey("listenTogetherRoomCode")

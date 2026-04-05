@@ -53,7 +53,7 @@ class PlayerConnection(
     context: Context,
     binder: MusicBinder,
     val database: MusicDatabase,
-    scope: CoroutineScope,
+    private val scope: CoroutineScope,
 ) : Player.Listener {
     private companion object {
         private const val TAG = "PlayerConnection"
@@ -132,14 +132,20 @@ class PlayerConnection(
         Timber.tag(TAG).d("PlayerConnection state flows initialized successfully")
     }
 
-    // Effective playing state, considers Cast when active
+    // Effective playing state, considers Connect and Cast when active
     val isEffectivelyPlaying =
         combine(
             isPlaying,
             service.castConnectionHandler?.isCasting ?: MutableStateFlow(false),
             service.castConnectionHandler?.castIsPlaying ?: MutableStateFlow(false),
-        ) { localPlaying, isCasting, castPlaying ->
-            if (isCasting) castPlaying else localPlaying
+            service.connectManager?.isControlling ?: MutableStateFlow(false),
+            service.connectManager?.remotePlaybackState ?: MutableStateFlow(null),
+        ) { localPlaying, isCasting, castPlaying, isConnectControlling, remoteState ->
+            when {
+                isConnectControlling -> remoteState?.isPlaying ?: false
+                isCasting -> castPlaying
+                else -> localPlaying
+            }
         }.stateIn(
             scope,
             SharingStarted.Lazily,
@@ -229,6 +235,24 @@ class PlayerConnection(
     }
 
     fun playQueue(queue: Queue) {
+        val connectMgr = service.connectManager
+        if (connectMgr?.isControlling?.value == true) {
+            scope.launch {
+                try {
+                    val initialStatus = queue.getInitialStatus()
+                    val currentTrackId = initialStatus.items.getOrNull(initialStatus.mediaItemIndex)?.mediaId
+                    connectMgr.playQueue(
+                        initialStatus.items,
+                        initialStatus.title,
+                        currentTrackId,
+                        initialStatus.position,
+                    )
+                } catch (e: Exception) {
+                    Timber.tag(TAG).e(e, "Error redirecting playQueue to Connect")
+                }
+            }
+            return
+        }
         // Block if Listen Together guest (unless internal sync)
         if (!allowInternalSync && shouldBlockPlaybackChanges?.invoke() == true) {
             Timber.tag("PlayerConnection").d("playQueue blocked - Listen Together guest")
@@ -265,6 +289,11 @@ class PlayerConnection(
     fun playNext(item: MediaItem) = playNext(listOf(item))
 
     fun playNext(items: List<MediaItem>) {
+        val connectMgr = service.connectManager
+        if (connectMgr?.isControlling?.value == true) {
+            connectMgr.playNext(items)
+            return
+        }
         // Block if Listen Together guest (unless internal sync)
         if (!allowInternalSync && shouldBlockPlaybackChanges?.invoke() == true) {
             Timber.tag("PlayerConnection").d("playNext blocked - Listen Together guest")
@@ -281,6 +310,11 @@ class PlayerConnection(
     fun addToQueue(item: MediaItem) = addToQueue(listOf(item))
 
     fun addToQueue(items: List<MediaItem>) {
+        val connectMgr = service.connectManager
+        if (connectMgr?.isControlling?.value == true) {
+            connectMgr.addToQueue(items)
+            return
+        }
         // Block if Listen Together guest (unless internal sync)
         if (!allowInternalSync && shouldBlockPlaybackChanges?.invoke() == true) {
             Timber.tag("PlayerConnection").d("addToQueue blocked - Listen Together guest")
@@ -319,11 +353,18 @@ class PlayerConnection(
     }
 
     /**
-     * Toggle play/pause - handles Cast when active
+     * Toggle play/pause - handles Connect, Cast, or local player
      */
     fun togglePlayPause() {
         if (!allowInternalSync && shouldBlockPlaybackChanges?.invoke() == true) return
         try {
+            // Connect takes priority over Cast
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                val remote = connectMgr.remotePlaybackState.value
+                if (remote?.isPlaying == true) connectMgr.pause() else connectMgr.play()
+                return
+            }
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {
                 if (castHandler.castIsPlaying.value) {
@@ -340,10 +381,15 @@ class PlayerConnection(
     }
 
     /**
-     * Start playback - handles Cast when active
+     * Start playback - handles Connect, Cast, or local player
      */
     fun play() {
         try {
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.play()
+                return
+            }
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {
                 castHandler.play()
@@ -359,10 +405,15 @@ class PlayerConnection(
     }
 
     /**
-     * Pause playback - handles Cast when active
+     * Pause playback - handles Connect, Cast, or local player
      */
     fun pause() {
         try {
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.pause()
+                return
+            }
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {
                 castHandler.pause()
@@ -375,10 +426,15 @@ class PlayerConnection(
     }
 
     /**
-     * Seek to position - handles Cast when active
+     * Seek to position - handles Connect, Cast, or local player
      */
     fun seekTo(position: Long) {
         try {
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.seekTo(position)
+                return
+            }
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {
                 castHandler.seekTo(position)
@@ -390,8 +446,32 @@ class PlayerConnection(
         }
     }
 
+    fun seekToDefaultPosition(index: Int, trackId: String? = null) {
+        try {
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.changeTrack(index, trackId)
+                return
+            }
+
+            player.seekToDefaultPosition(index)
+            if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
+                player.prepare()
+            }
+            player.playWhenReady = true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Error in seekToDefaultPosition")
+        }
+    }
+
     fun seekToNext() {
         try {
+            // Connect takes priority
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.skipNext()
+                return
+            }
             // When casting, use Cast skip instead of local player
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {
@@ -413,6 +493,12 @@ class PlayerConnection(
 
     fun seekToPrevious() {
         try {
+            // Connect takes priority
+            val connectMgr = service.connectManager
+            if (connectMgr?.isControlling?.value == true) {
+                connectMgr.skipPrevious()
+                return
+            }
             // When casting, use Cast skip instead of local player
             val castHandler = service.castConnectionHandler
             if (castHandler?.isCasting?.value == true) {

@@ -168,8 +168,10 @@ import com.metrolist.music.ui.component.AppNavigationBar
 import com.metrolist.music.ui.component.AppNavigationRail
 import com.metrolist.music.ui.component.BottomSheetMenu
 import com.metrolist.music.ui.component.BottomSheetPage
+import com.metrolist.music.ui.component.ConnectDevicePicker
 import com.metrolist.music.ui.component.LocalBottomSheetPageState
 import com.metrolist.music.ui.component.LocalMenuState
+import com.metrolist.music.ui.component.MenuState
 import com.metrolist.music.ui.component.rememberBottomSheetState
 import com.metrolist.music.ui.component.shimmer.ShimmerTheme
 import com.metrolist.music.ui.menu.YouTubeSongMenu
@@ -217,6 +219,7 @@ class MainActivity : ComponentActivity() {
         private const val ACTION_SEARCH = "com.metrolist.music.action.SEARCH"
         private const val ACTION_LIBRARY = "com.metrolist.music.action.LIBRARY"
         const val ACTION_RECOGNITION = "com.metrolist.music.action.RECOGNITION"
+        const val ACTION_OPEN_CONNECT_PICKER = "com.metrolist.music.action.OPEN_CONNECT_PICKER"
         const val EXTRA_AUTO_START_RECOGNITION = "auto_start_recognition"
     }
 
@@ -804,15 +807,39 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                LaunchedEffect(playerConnection) {
-                    val player = playerConnection?.player ?: return@LaunchedEffect
-                    if (player.currentMediaItem == null) {
-                        if (!playerBottomSheetState.isDismissed) {
-                            playerBottomSheetState.dismiss()
-                        }
-                    } else {
+                val localCurrentMetadata by playerConnection?.mediaMetadata?.collectAsState(initial = null)
+                    ?: remember { mutableStateOf(null) }
+                val connectManager = remember(playerConnection) {
+                    try {
+                        playerConnection?.service?.connectManager
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                val isConnectControlling by connectManager?.isControlling?.collectAsState()
+                    ?: remember { mutableStateOf(false) }
+                val remotePlaybackState by connectManager?.remotePlaybackState?.collectAsState()
+                    ?: remember { mutableStateOf(null) }
+
+                LaunchedEffect(
+                    localCurrentMetadata?.id,
+                    isConnectControlling,
+                    remotePlaybackState?.currentTrack?.id,
+                    remotePlaybackState?.queue?.size,
+                    playerBottomSheetState,
+                ) {
+                    val hasRemoteTrack =
+                        remotePlaybackState?.currentTrack != null ||
+                            remotePlaybackState?.queue?.isNotEmpty() == true
+                    val shouldShowPlayer = localCurrentMetadata != null || (isConnectControlling && hasRemoteTrack)
+
+                    if (shouldShowPlayer) {
                         if (playerBottomSheetState.isDismissed) {
                             playerBottomSheetState.collapseSoft()
+                        }
+                    } else {
+                        if (!playerBottomSheetState.isDismissed) {
+                            playerBottomSheetState.dismiss()
                         }
                     }
                 }
@@ -856,13 +883,41 @@ class MainActivity : ComponentActivity() {
                     mutableStateOf(null)
                 }
                 val snackbarHostState = remember { SnackbarHostState() }
+                val menuState = LocalMenuState.current
+                var pendingConnectPickerIntent by rememberSaveable { mutableStateOf(false) }
+
+                val requestConnectPickerOpen: (Intent) -> Unit =
+                    remember {
+                        { launchIntent ->
+                            if (launchIntent.action == ACTION_OPEN_CONNECT_PICKER) {
+                                pendingConnectPickerIntent = true
+                                launchIntent.action = null
+                            }
+                        }
+                    }
+
+                LaunchedEffect(pendingConnectPickerIntent, playerConnection, menuState) {
+                    if (!pendingConnectPickerIntent) return@LaunchedEffect
+                    val connectManager = playerConnection?.service?.connectManager
+                    if (connectManager != null) {
+                        menuState.show {
+                            ConnectDevicePicker(
+                                connectManager = connectManager,
+                                onDismiss = menuState::dismiss,
+                            )
+                        }
+                        pendingConnectPickerIntent = false
+                    }
+                }
 
                 LaunchedEffect(Unit) {
                     if (pendingIntent != null) {
+                        requestConnectPickerOpen(pendingIntent!!)
                         handleRecognitionIntent(pendingIntent!!, navController)
                         handleDeepLinkIntent(pendingIntent!!, navController)
                         pendingIntent = null
                     } else {
+                        requestConnectPickerOpen(intent)
                         handleRecognitionIntent(intent, navController)
                         handleDeepLinkIntent(intent, navController)
                     }
@@ -871,6 +926,7 @@ class MainActivity : ComponentActivity() {
                 DisposableEffect(Unit) {
                     val listener =
                         Consumer<Intent> { intent ->
+                            requestConnectPickerOpen(intent)
                             handleRecognitionIntent(intent, navController)
                             handleDeepLinkIntent(intent, navController)
                         }
